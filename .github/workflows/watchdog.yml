@@ -1,0 +1,68 @@
+# runwatch watchdog - runs on GitHub, independent of the cluster.
+# Every 30 min: if the last snapshot (= time of the last push) is older than STALE_MINUTES,
+# send one ntfy push per outage. Needs the repository secret NTFY_TOPIC.
+# Install in the cluster clone (~/runwatch-pages/.github/workflows/watchdog.yml), not via the
+# GitHub web UI: runwatch force-pushes, so files added on GitHub would disappear.
+name: runwatch watchdog
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # GitHub may start scheduled runs a few minutes late
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test notification now"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  STALE_MINUTES: 45
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Age of the last snapshot
+        id: age
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          read -r sha date < <(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha[0:12] + " " + .commit.committer.date')
+          minutes=$(( ($(date +%s) - $(date -d "$date" +%s)) / 60 ))
+          echo "last snapshot $sha: $minutes min ago"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "minutes=$minutes" >> "$GITHUB_OUTPUT"
+          if [ "$minutes" -gt "$STALE_MINUTES" ]; then echo "stale=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Already notified for this snapshot?
+        if: steps.age.outputs.stale == 'true'
+        id: seen
+        uses: actions/cache/restore@v4
+        with:
+          path: .notified
+          key: notified-${{ steps.age.outputs.sha }}
+
+      - name: Notify phone
+        if: (steps.age.outputs.stale == 'true' && steps.seen.outputs.cache-hit != 'true') || inputs.test
+        env:
+          TOPIC: ${{ secrets.NTFY_TOPIC }}
+          AGE: ${{ steps.age.outputs.minutes }}
+          TEST: ${{ inputs.test }}
+        run: |
+          if [ -z "$TOPIC" ]; then echo "::error::repository secret NTFY_TOPIC is not set"; exit 1; fi
+          title="runwatch collector stopped"
+          [ "$TEST" = "true" ] && title="runwatch watchdog test"
+          curl -sf -H "Title: $title" -H "Priority: high" -H "Tags: warning" \
+            -d "No new snapshot for ${AGE} min. On logc0004: crontab -l (restore: crontab ~/.runwatch/crontab.txt), tail ~/.runwatch/collect.log" \
+            "https://ntfy.sh/$TOPIC"
+          mkdir -p .notified && date > .notified/at
+
+      - name: Remember the notification
+        if: steps.age.outputs.stale == 'true' && steps.seen.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .notified
+          key: notified-${{ steps.age.outputs.sha }}
